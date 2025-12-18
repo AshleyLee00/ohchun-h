@@ -828,6 +828,11 @@
             
             // 응답 상태 확인
             if (!res.ok) {
+                // 429 에러 (Too Many Requests) 특별 처리
+                if (res.status === 429) {
+                    console.warn('API 요청 한도 초과 (429). 모의 데이터를 사용합니다.');
+                    throw new Error('API 요청 한도 초과 (429)');
+                }
                 throw new Error(`HTTP error! status: ${res.status}`);
             }
             
@@ -898,14 +903,33 @@
             
             // API 오류인 경우 모의 데이터 사용
             if (error.message.includes('API 요청 한도 초과') || 
+                error.message.includes('429') ||
                 error.message.includes('서비스 오류') || 
                 error.message.includes('API 키 인증 실패')) {
                 console.log('API 오류로 인해 모의 데이터를 사용합니다.');
                 const mockData = generateMockAirQualityData();
+                // 429 에러 발생 시 캐시에 저장하여 다음 업데이트까지 더 긴 시간 확보
                 saveAirQualityDataToCache(mockData);
+                // 429 에러 발생 시 다음 업데이트까지 최소 2시간 대기하도록 타임스탬프 조정
+                if (error.message.includes('429')) {
+                    try {
+                        // 현재 시간에서 2시간 전으로 설정하여 다음 업데이트까지 더 긴 시간 확보
+                        const extendedTimestamp = Date.now() - (AIR_QUALITY_UPDATE_INTERVAL * 2);
+                        localStorage.setItem(AIR_QUALITY_TIMESTAMP_KEY, extendedTimestamp.toString());
+                        console.log('429 에러 발생으로 인해 다음 업데이트까지 대기 시간을 연장했습니다.');
+                    } catch (e) {
+                        console.error('타임스탬프 조정 실패:', e);
+                    }
+                }
             } else {
-                // 기타 오류인 경우 데이터 없음 표시
-                setNoDataDisplay();
+                // 기타 오류인 경우 캐시 데이터가 있으면 사용, 없으면 데이터 없음 표시
+                const cachedData = getCachedAirQualityData();
+                if (cachedData) {
+                    console.log('오류 발생으로 캐시된 데이터를 사용합니다.');
+                    displayAirQualityData(cachedData);
+                } else {
+                    setNoDataDisplay();
+                }
             }
         }
     }
@@ -943,11 +967,12 @@
     // 캐시 키 상수
     const AIR_QUALITY_CACHE_KEY = 'airQualityData';
     const AIR_QUALITY_TIMESTAMP_KEY = 'airQualityTimestamp';
-    const AIR_QUALITY_UPDATE_INTERVAL = 5 * 60 * 1000; // 5분 (밀리초) - 테스트용으로 짧게 설정
+    const AIR_QUALITY_UPDATE_INTERVAL = 60 * 60 * 1000; // 1시간 (밀리초) - 대기질은 자주 변하지 않으므로 1시간마다 업데이트
+    const AIR_QUALITY_RATE_LIMIT_INTERVAL = 2 * 60 * 60 * 1000; // 2시간 (밀리초) - 429 에러 발생 시 최소 대기 시간
     
     const WEATHER_CACHE_KEY = 'weatherData';
     const WEATHER_TIMESTAMP_KEY = 'weatherTimestamp';
-    const WEATHER_UPDATE_INTERVAL = 5 * 60 * 1000; // 5분 (밀리초) - 테스트용으로 짧게 설정
+    const WEATHER_UPDATE_INTERVAL = 30 * 60 * 1000; // 30분 (밀리초) - 날씨는 좀 더 자주 업데이트
 
     // 캐시에서 데이터 가져오기
     function getCachedAirQualityData() {
@@ -960,7 +985,7 @@
                 const lastUpdate = parseInt(timestamp);
                 const now = Date.now();
                 
-                // 1시간이 지나지 않았다면 캐시된 데이터 사용
+                // 업데이트 간격이 지나지 않았다면 캐시된 데이터 사용
                 if (now - lastUpdate < AIR_QUALITY_UPDATE_INTERVAL) {
                     console.log('캐시된 대기질 데이터 사용 중...');
                     return data;
@@ -983,14 +1008,34 @@
         }
     }
 
-    // 대기질 정보 업데이트 함수 (2시간마다)
+    // 대기질 정보 업데이트 함수 (1시간마다)
     async function updateAirQualityIfNeeded() {
         // 먼저 캐시에서 데이터 확인
         const cachedData = getCachedAirQualityData();
         if (cachedData) {
-            // 캐시가 유효하면 표시 함수 호출하지 않음 (이미 표시되어 있음)
+            // 캐시가 유효하면 화면에 표시하고 API 호출하지 않음
             console.log('캐시된 대기질 데이터가 유효합니다.');
+            displayAirQualityData(cachedData);
             return;
+        }
+        
+        // 캐시에 데이터가 없거나 만료된 경우에도 429 에러 방지를 위해 추가 확인
+        try {
+            const timestamp = localStorage.getItem(AIR_QUALITY_TIMESTAMP_KEY);
+            if (timestamp) {
+                const lastUpdate = parseInt(timestamp);
+                const now = Date.now();
+                // 429 에러 발생 후 최소 대기 시간이 지나지 않았다면 API 호출하지 않음
+                if (now - lastUpdate < AIR_QUALITY_RATE_LIMIT_INTERVAL) {
+                    console.log('429 에러 대기 시간 중입니다. 캐시된 데이터를 사용합니다.');
+                    if (cachedData) {
+                        displayAirQualityData(cachedData);
+                    }
+                    return;
+                }
+            }
+        } catch (e) {
+            console.error('타임스탬프 확인 실패:', e);
         }
         
         // 캐시에 데이터가 없거나 만료된 경우에만 API 호출
@@ -1009,7 +1054,7 @@
                 const lastUpdate = parseInt(timestamp);
                 const now = Date.now();
                 
-                // 1시간이 지나지 않았다면 캐시된 데이터 사용
+                // 업데이트 간격이 지나지 않았다면 캐시된 데이터 사용
                 if (now - lastUpdate < WEATHER_UPDATE_INTERVAL) {
                     console.log('캐시된 날씨 데이터 사용 중...');
                     return data;
@@ -1124,8 +1169,8 @@
 
     // 초기 데이터 로드 함수 (캐시 확인 후 표시 또는 API 호출)
     async function loadInitialData() {
-        // 테스트를 위해 캐시 강제 초기화 (필요시 주석 처리)
-        clearAllCache();
+        // 캐시 강제 초기화 제거 - 캐시를 활용하여 API 호출 최소화
+        // clearAllCache(); // 테스트 시에만 주석 해제
         
         // 날씨 데이터 로드
         const cachedWeatherData = getCachedWeatherData();
@@ -1161,18 +1206,20 @@
         loadInitialData();
         
         // 주기적 업데이트 설정
-        setInterval(updateWeatherIfNeeded, 5 * 60 * 1000); // 5분마다 체크
-        setInterval(updateAirQualityIfNeeded, 5 * 60 * 1000); // 5분마다 체크
+        setInterval(updateWeatherIfNeeded, 30 * 60 * 1000); // 30분마다 체크
+        setInterval(updateAirQualityIfNeeded, 60 * 60 * 1000); // 1시간마다 체크 (대기질은 자주 변하지 않음)
         
-        // 페이지가 포커스를 받았을 때 업데이트 체크
+        // 페이지가 포커스를 받았을 때 업데이트 체크 (캐시 확인 후 필요시에만 업데이트)
         window.addEventListener('focus', function() {
+            // 함수 내부에서 캐시를 확인하므로 안전하게 호출 가능
             updateWeatherIfNeeded();
             updateAirQualityIfNeeded();
         });
         
-        // 페이지가 보이게 될 때 업데이트 체크 (탭 전환 시)
+        // 페이지가 보이게 될 때 업데이트 체크 (탭 전환 시, 캐시 확인 후 필요시에만 업데이트)
         document.addEventListener('visibilitychange', function() {
             if (!document.hidden) {
+                // 함수 내부에서 캐시를 확인하므로 안전하게 호출 가능
                 updateWeatherIfNeeded();
                 updateAirQualityIfNeeded();
             }
