@@ -615,8 +615,8 @@ def main():
     # 학교 정보
     school_info = {
         "name": "오천고등학교",
-        "notice_url": "http://yulgok-h.goepj.kr/yulgok-h/na/ntt/selectRssFeed.do?mi=3812&bbsId=3050",
-        "letter_url": "http://yulgok-h.goepj.kr/yulgok-h/na/ntt/selectRssFeed.do?mi=3813&bbsId=3051"
+        "notice_url": "https://school.gyo6.net/ocheonhs/na/ntt/selectNttList.do?mi=159124&bbsId=76555",
+        "letter_url": "https://school.gyo6.net/ocheonhs/na/ntt/selectNttList.do?mi=159125&bbsId=76556"
     }
     
     # 공지사항 크롤링

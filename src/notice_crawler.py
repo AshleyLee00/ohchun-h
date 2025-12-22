@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-학교 홈페이지 공지사항 RSS 크롤러
-RSS 피드를 통해 공지사항을 크롤링하는 모듈입니다.
+학교 홈페이지 공지사항 크롤러
+HTML 페이지를 직접 크롤링하여 공지사항을 수집하는 모듈입니다.
 """
 
 import json
@@ -11,9 +11,9 @@ import logging
 import os
 import re
 import requests
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 
 # 로그 파일 경로 설정
 log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
@@ -31,10 +31,10 @@ logging.basicConfig(
 
 def crawl_school_notices(url, site_name=None):
     """
-    학교 홈페이지 공지사항을 RSS 피드로 크롤링합니다.
+    학교 홈페이지 공지사항을 HTML 페이지에서 직접 크롤링합니다.
     
     Args:
-        url (str): 공지사항 RSS 피드 URL
+        url (str): 공지사항 목록 페이지 URL
         site_name (str, optional): 사이트 이름, 없으면 URL에서 추출
         
     Returns:
@@ -48,7 +48,7 @@ def crawl_school_notices(url, site_name=None):
         else:
             site_name = "unknown_site"
     
-    logging.info(f"{site_name} 공지사항 RSS 크롤러 시작...")
+    logging.info(f"{site_name} 공지사항 HTML 크롤러 시작...")
     
     # 웹 페이지 요청
     headers = {
@@ -58,125 +58,201 @@ def crawl_school_notices(url, site_name=None):
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
+        response.encoding = 'utf-8'  # 한글 인코딩 설정
     except requests.RequestException as e:
         logging.error(f"요청 중 오류 발생: {e}")
         return {
             "notices": [],
             "meta": {
                 "total_count": 0,
-                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "last_updated": datetime.now().strftime("%Y-%m-%d"),
                 "source": site_name,
                 "url": url,
                 "error": str(e)
             }
         }
     
-    # RSS XML 파싱
+    # HTML 파싱
     try:
-        root = ET.fromstring(response.text)
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        # item 요소들 찾기 (여러 방법 시도)
-        items = root.findall('.//item')
-        if not items:
-            # 다른 태그명으로 시도
-            items = root.findall('.//entry')  # Atom 형식
-        if not items:
-            # 네임스페이스와 함께 시도
-            namespaces = {'rss': 'http://purl.org/rss/1.0/'}
-            items = root.findall('.//rss:item', namespaces)
+        # 공지사항 테이블 찾기
+        # 여러 방법으로 시도
+        tbody = None
         
+        # 방법 1: CSS 셀렉터로 직접 찾기
+        tbody = soup.select_one('#subContent > div > div.BD_list > table > tbody')
+        
+        # 방법 2: 단계별로 찾기
+        if not tbody:
+            sub_content = soup.find(id='subContent')
+            if sub_content:
+                div = sub_content.find('div')
+                if div:
+                    bd_list = div.find('div', class_='BD_list')
+                    if bd_list:
+                        table = bd_list.find('table')
+                        if table:
+                            tbody = table.find('tbody')
+        
+        # 방법 3: class_='BD_list'로 찾기
+        if not tbody:
+            bd_list = soup.find('div', class_='BD_list')
+            if bd_list:
+                table = bd_list.find('table')
+                if table:
+                    tbody = table.find('tbody')
+        
+        # 방법 4: 모든 table에서 tbody 찾기
+        if not tbody:
+            tables = soup.find_all('table')
+            for table in tables:
+                tbody = table.find('tbody')
+                if tbody:
+                    # tbody에 tr이 있는지 확인
+                    rows = tbody.find_all('tr')
+                    if len(rows) > 0:
+                        # 첫 번째 행에 td가 있는지 확인
+                        first_row = rows[0]
+                        if first_row.find_all('td'):
+                            break
+            else:
+                tbody = None
+        
+        if not tbody:
+            # 디버깅: HTML 일부 저장
+            debug_html = soup.prettify()[:5000]  # 처음 5000자만
+            logging.error(f"공지사항 테이블을 찾을 수 없습니다. HTML 샘플: {debug_html}")
+            return {
+                "notices": [],
+                "meta": {
+                    "total_count": 0,
+                    "last_updated": datetime.now().strftime("%Y-%m-%d"),
+                    "source": site_name,
+                    "url": url,
+                    "error": "공지사항 테이블을 찾을 수 없습니다."
+                }
+            }
+        
+        # 테이블의 모든 행(tr)을 찾습니다
+        rows = tbody.find_all('tr')
         notices = []
         
-        for item in items:
+        for row in rows:
+            # 헤더 행은 건너뜁니다
+            if row.find('th'):
+                continue
+                
+            # td 요소들을 찾습니다
+            cells = row.find_all('td')
+            if len(cells) < 4:  # 최소 4개 컬럼 필요 (번호, 제목, 작성자, 등록일)
+                continue
+                
             try:
-                # 제목 추출
-                title_elem = item.find('title')
-                title = title_elem.text if title_elem is not None else ""
-                if title.startswith('<![CDATA['):
-                    title = title[9:-3]  # CDATA 태그 제거
+                # 번호 추출
+                number_cell = cells[0]
+                number = number_cell.get_text(strip=True)
                 
-                # 링크 추출
-                link_elem = item.find('link')
-                link = link_elem.text if link_elem is not None else ""
-                if link.startswith('<![CDATA['):
-                    link = link[9:-3]  # CDATA 태그 제거
-                
-                # 상대 경로인 경우 절대 경로로 변환
-                if link and not link.startswith('http'):
-                    base_url = re.search(r'https?://[^/]+', url)
-                    if base_url:
-                        link = urljoin(base_url.group(0), link)
-                
-                # 날짜 추출
-                date_elem = item.find('pubDate')
-                date_text = date_elem.text if date_elem is not None else ""
-                if date_text.startswith('<![CDATA['):
-                    date_text = date_text[9:-3]  # CDATA 태그 제거
-                
-                # 작성자 추출
-                author_elem = item.find('author')
-                author = author_elem.text if author_elem is not None else ""
-                if author.startswith('<![CDATA['):
-                    author = author[9:-3]  # CDATA 태그 제거
-                
-                # 날짜 형식 변환
-                try:
-                    # RSS 날짜 형식 (예: Wed, 02 Jul 2025 23:17:42 GMT)
-                    if 'GMT' in date_text:
-                        date_obj = datetime.strptime(date_text, "%a, %d %b %Y %H:%M:%S GMT")
-                    elif 'T' in date_text:
-                        # ISO 형식 (예: 2025-09-25T19:16:27)
-                        date_obj = datetime.strptime(date_text.split('T')[0], "%Y-%m-%d")
+                # 제목과 링크 추출 - td.ta_l 클래스를 가진 셀의 a 태그
+                title_cell = row.find('td', class_='ta_l')
+                if title_cell:
+                    title_link = title_cell.find('a')
+                    if title_link:
+                        title = title_link.get_text(strip=True)
+                        link = title_link.get('href', '')
+                        
+                        # JavaScript 링크 처리
+                        if link.startswith('javascript:'):
+                            onclick = title_link.get('onclick', '')
+                            if onclick:
+                                # onclick에서 파라미터 추출
+                                match = re.search(r"['\"](\d+)['\"]", onclick)
+                                if match:
+                                    ntt_sn = match.group(1)
+                                    # 상세보기 URL 생성
+                                    link = f"/ocheonhs/na/ntt/selectNttView.do?mi=159124&bbsId=76555&nttSn={ntt_sn}"
+                                else:
+                                    link = ""
+                        
+                        if link and not link.startswith('http'):
+                            link = urljoin(url, link)
                     else:
-                        # RSS 날짜 형식 (예: Mon, 24 Jun 2025 10:30:00 +0900)
-                        try:
-                            date_obj = datetime.strptime(date_text, "%a, %d %b %Y %H:%M:%S %z")
-                        except ValueError:
-                            # 다른 형식 시도
-                            date_obj = datetime.strptime(date_text, "%Y-%m-%d %H:%M:%S")
-                    
-                    formatted_date = date_obj.strftime('%Y-%m-%d')
-                except ValueError:
-                    try:
-                        # 다른 형식 시도
-                        date_obj = datetime.strptime(date_text, "%Y-%m-%d %H:%M:%S")
-                        formatted_date = date_obj.strftime('%Y-%m-%d')
-                    except ValueError:
-                        # 시간 정보가 포함된 다른 형식들 처리
-                        if 'T' in date_text:
-                            # ISO 형식 (예: 2025-06-24T16:03:22)
-                            date_part = date_text.split('T')[0]
-                            formatted_date = date_part
-                        else:
-                            formatted_date = date_text
+                        title = title_cell.get_text(strip=True)
+                        link = ""
+                else:
+                    # fallback: 두 번째 셀에서 제목 찾기
+                    title_cell = cells[1]
+                    title_link = title_cell.find('a')
+                    if title_link:
+                        title = title_link.get_text(strip=True)
+                        link = title_link.get('href', '')
+                        if link and not link.startswith('http'):
+                            link = urljoin(url, link)
+                    else:
+                        title = title_cell.get_text(strip=True)
+                        link = ""
+                
+                # 날짜 추출 (일반적으로 4번째 셀, 인덱스 3)
+                date_text = ""
+                # 먼저 특정 인덱스에서 찾기 시도
+                if len(cells) > 3:
+                    date_cell = cells[3]
+                    cell_text = date_cell.get_text(strip=True)
+                    # YYYY.MM.DD 형식 찾기 (셀에 다른 텍스트가 있을 수 있음)
+                    date_match = re.search(r'(\d{4}\.\d{2}\.\d{2})', cell_text)
+                    if date_match:
+                        date_text = date_match.group(1)
+                
+                # 인덱스에서 못 찾았으면 모든 셀에서 찾기
+                if not date_text:
+                    for idx, cell in enumerate(cells):
+                        cell_text = cell.get_text(strip=True)
+                        # YYYY.MM.DD 형식 찾기 (셀에 다른 텍스트가 있을 수 있음)
+                        date_match = re.search(r'(\d{4}\.\d{2}\.\d{2})', cell_text)
+                        if date_match:
+                            date_text = date_match.group(1)
+                            logging.debug(f"날짜를 인덱스 {idx}에서 찾았습니다: {date_text}")
+                            break
+                
+                if not date_text:
+                    logging.warning(f"날짜를 찾을 수 없습니다. 셀 내용: {[cell.get_text(strip=True) for cell in cells]}")
+                
+                # 날짜 형식 정리 (YYYY.MM.DD 형식을 YYYY-MM-DD로 변환)
+                try:
+                    if re.match(r'\d{4}\.\d{2}\.\d{2}', date_text):
+                        formatted_date = date_text.replace('.', '-')
+                    else:
+                        formatted_date = date_text
+                except:
+                    formatted_date = date_text
                 
                 notice_data = {
-                    "number": str(len(notices) + 1),
+                    "number": number,
                     "title": title,
-                    "author": author,
+                    "author": "",
                     "date": formatted_date,
                     "views": "0",
                     "url": link
                 }
                 
                 notices.append(notice_data)
-                
+                    
             except Exception as e:
-                logging.error(f"RSS 항목 파싱 중 오류 발생: {e}")
+                logging.error(f"행 파싱 중 오류 발생: {e}")
                 continue
         
-        logging.info(f"공지사항 RSS 크롤링 완료: {len(notices)}개")
+        logging.info(f"공지사항 HTML 크롤링 완료: {len(notices)}개")
         
-    except ET.ParseError as e:
-        logging.error(f"RSS XML 파싱 오류: {e}")
+    except Exception as e:
+        logging.error(f"HTML 파싱 오류: {e}")
         return {
             "notices": [],
             "meta": {
                 "total_count": 0,
-                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "last_updated": datetime.now().strftime("%Y-%m-%d"),
                 "source": site_name,
                 "url": url,
-                "error": f"RSS XML 파싱 오류: {str(e)}"
+                "error": f"HTML 파싱 오류: {str(e)}"
             }
         }
     
@@ -185,21 +261,21 @@ def crawl_school_notices(url, site_name=None):
         "notices": notices,
         "meta": {
             "total_count": len(notices),
-            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "last_updated": datetime.now().strftime("%Y-%m-%d"),
             "source": site_name,
             "url": url
         }
     }
     
-    logging.info(f"크롤링 완료: {len(notices)}개 공지사항")
+    logging.info(f"공지사항 HTML 크롤링 완료: {len(notices)}개")
     return result
 
 if __name__ == "__main__":
-    # 오천고등학교 RSS URL
-    test_url = "https://school.gyo6.net/ocheonhs/na/ntt/selectRssFeed.do?mi=159124&bbsId=76555&maxSn=20"
+    # 오천고등학교 공지사항 목록 페이지 URL
+    test_url = "https://school.gyo6.net/ocheonhs/na/ntt/selectNttList.do?mi=159124&bbsId=76555"
     result = crawl_school_notices(test_url, "오천고등학교")
     
     # 모든 공지사항 출력
     print("\n공지사항 목록:")
     for i, notice in enumerate(result["notices"], 1):
-        print(f"{i}. {notice.get('title')} ({notice.get('date')}) - {notice.get('author')}") 
+        print(f"{notice.get('title')}\t{notice.get('date')}") 
